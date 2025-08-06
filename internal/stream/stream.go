@@ -8,7 +8,9 @@ import (
 	"io"
 	"math"
 	"os"
+	"strings"
 	"sync"
+	"time"
 
 	"github.com/OpenListTeam/OpenList/v4/internal/conf"
 	"github.com/OpenListTeam/OpenList/v4/internal/errs"
@@ -18,6 +20,12 @@ import (
 	"go4.org/readerutil"
 )
 
+// Check if the file is UDF related (ISO, Blu-ray images, etc.)
+func IsUDFType(filename string) bool {
+	ext := strings.ToLower(utils.GetFileExt(filename))
+	return ext == ".iso" || ext == ".img" || strings.Contains(strings.ToLower(filename), "bluray")
+}
+
 type FileStream struct {
 	Ctx context.Context
 	model.Obj
@@ -25,10 +33,16 @@ type FileStream struct {
 	Mimetype          string
 	WebPutAsTask      bool
 	ForceStreamUpload bool
-	Exist             model.Obj //the file existed in the destination, we can reuse some info since we wil overwrite it
+	Exist             model.Obj // Existing file in target that can reuse some information
 	utils.Closers
-	tmpFile  *os.File //if present, tmpFile has full content, it will be deleted at last
-	peekBuff *bytes.Reader
+	tmpFile    *os.File // If exists, contains complete content and will be deleted eventually
+	peekBuff   *bytes.Reader
+	rangeCache sync.Map // Caches small range read results, key: "start-end", value: cachedItem
+}
+
+type cachedItem struct {
+	reader    io.Reader
+	isUDFMeta bool // Whether this is UDF metadata
 }
 
 func (f *FileStream) GetSize() int64 {
@@ -56,6 +70,11 @@ func (f *FileStream) IsForceStreamUpload() bool {
 func (f *FileStream) Close() error {
 	var err1, err2 error
 
+	// Clean up memory cache (critical modification: release all caches when closing)
+	f.peekBuff = nil
+	f.rangeCache = sync.Map{} // Clear range cache
+
+	// Original closing logic
 	err1 = f.Closers.Close()
 	if errors.Is(err1, os.ErrClosed) {
 		err1 = nil
@@ -75,13 +94,19 @@ func (f *FileStream) Close() error {
 func (f *FileStream) GetExist() model.Obj {
 	return f.Exist
 }
+
 func (f *FileStream) SetExist(obj model.Obj) {
 	f.Exist = obj
 }
 
-// CacheFullInTempFile save all data into tmpFile. Not recommended since it wears disk,
-// and can't start upload until the file is written. It's not thread-safe!
+// CacheFullInTempFile saves all data to a temporary file. Not recommended as it wears out the disk,
+// and upload can only start after file writing is complete. Not thread-safe!
 func (f *FileStream) CacheFullInTempFile() (model.File, error) {
+	// Disable automatic full caching for UDF files (unless explicitly required)
+	if IsUDFType(f.Obj.GetName()) && !f.ForceStreamUpload {
+		return nil, fmt.Errorf("skip full cache for UDF file")
+	}
+
 	if file := f.GetFile(); file != nil {
 		return file, nil
 	}
@@ -105,9 +130,66 @@ func (f *FileStream) GetFile() model.File {
 	return nil
 }
 
-// RangeRead have to cache all data first since only Reader is provided.
-// also support a peeking RangeRead at very start, but won't buffer more than conf.MaxBufferLimit data in memory
+// RangeRead must first cache all data since only a Reader is provided.
+// Also supports peeking RangeRead at the start position, but in-memory buffered data will not exceed conf.MaxBufferLimit
 func (f *FileStream) RangeRead(httpRange http_range.Range) (io.Reader, error) {
+	// 1. Identify UDF related files
+	isUDF := IsUDFType(f.Obj.GetName())
+
+	// 2. Handle priority caching for UDF file metadata regions
+	if isUDF {
+		// Adjust cache threshold: relax to 150MB for UDF files
+		adjustedLimit := max(int64(conf.MaxBufferLimit), 150*utils.MB)
+		
+		// Calculate actual required range
+		if httpRange.Length < 0 || httpRange.Start+httpRange.Length > f.GetSize() {
+			httpRange.Length = f.GetSize() - httpRange.Start
+		}
+		end := httpRange.Start + httpRange.Length
+
+		// Force in-memory caching if request is within UDF metadata region (first 150MB)
+		if httpRange.Start < 150*utils.MB {
+			// Ensure cache covers required range
+			if f.peekBuff == nil || int64(f.peekBuff.Len()) < end {
+				neededSize := end
+				currentSize := int64(0)
+				var existingBuf []byte
+
+				// Read existing cache
+				if f.peekBuff != nil {
+					currentSize = int64(f.peekBuff.Len())
+					existingBuf = make([]byte, currentSize)
+					if _, err := f.peekBuff.Read(existingBuf); err != nil && !errors.Is(err, io.EOF) {
+						return nil, fmt.Errorf("read existing buffer failed: %w", err)
+					}
+					// Reset peekBuff's read position
+					f.peekBuff.Seek(0, io.SeekStart)
+				}
+
+				// Read missing portion
+				readSize := neededSize - currentSize
+				if readSize > 0 {
+					newBuf := make([]byte, readSize)
+					n, err := io.ReadFull(f.Reader, newBuf)
+					if err != nil && !errors.Is(err, io.EOF) {
+						return nil, fmt.Errorf("read UDF data failed: %w", err)
+					}
+					// Merge caches
+					existingBuf = append(existingBuf, newBuf[:n]...)
+					currentSize += int64(n)
+				}
+
+				// Update in-memory cache
+				f.peekBuff = bytes.NewReader(existingBuf)
+				f.Reader = io.MultiReader(f.peekBuff, f.Reader)
+			}
+
+			// Return requested range from memory cache
+			return io.NewSectionReader(f.peekBuff, httpRange.Start, httpRange.Length), nil
+		}
+	}
+
+	// For non-UDF files or beyond metadata region, use original logic
 	if httpRange.Length < 0 || httpRange.Start+httpRange.Length > f.GetSize() {
 		httpRange.Length = f.GetSize() - httpRange.Start
 	}
@@ -116,14 +198,11 @@ func (f *FileStream) RangeRead(httpRange http_range.Range) (io.Reader, error) {
 		return io.NewSectionReader(cache, httpRange.Start, httpRange.Length), nil
 	}
 
-	size := httpRange.Start + httpRange.Length
-	if f.peekBuff != nil && size <= int64(f.peekBuff.Len()) {
+	if f.peekBuff != nil && httpRange.Start+httpRange.Length <= int64(f.peekBuff.Len()) {
 		return io.NewSectionReader(f.peekBuff, httpRange.Start, httpRange.Length), nil
 	}
-	if size <= int64(conf.MaxBufferLimit) {
-		bufSize := min(size, f.GetSize())
-		// 使用bytes.Buffer作为io.CopyBuffer的写入对象，CopyBuffer会调用Buffer.ReadFrom
-		// 即使被写入的数据量与Buffer.Cap一致，Buffer也会扩大
+	if httpRange.Start+httpRange.Length <= int64(conf.MaxBufferLimit) {
+		bufSize := min(httpRange.Start+httpRange.Length, f.GetSize())
 		buf := make([]byte, bufSize)
 		n, err := io.ReadFull(f.Reader, buf)
 		if err != nil {
@@ -145,16 +224,13 @@ func (f *FileStream) RangeRead(httpRange http_range.Range) (io.Reader, error) {
 var _ model.FileStreamer = (*SeekableStream)(nil)
 var _ model.FileStreamer = (*FileStream)(nil)
 
-//var _ seekableStream = (*FileStream)(nil)
-
-// for most internal stream, which is either RangeReadCloser or MFile
-// Any functionality implemented based on SeekableStream should implement a Close method,
-// whose only purpose is to close the SeekableStream object. If such functionality has
-// additional resources that need to be closed, they should be added to the Closer property of
-// the SeekableStream object and be closed together when the SeekableStream object is closed.
+// For most internal streams, they are either RangeReadCloser or MFile
+// Any functionality implemented based on SeekableStream should implement the Close method,
+// whose sole purpose is to close the SeekableStream object. If such functionality has
+// additional resources that need closing, they should be added to the Closer property of the SeekableStream object,
+// and closed together when the SeekableStream object is closed.
 type SeekableStream struct {
 	*FileStream
-	// should have one of belows to support rangeRead
 	rangeReadCloser model.RangeReadCloserIF
 	size            int64
 }
@@ -191,9 +267,42 @@ func NewSeekableStream(fs *FileStream, link *model.Link) (*SeekableStream, error
 		}
 		fs.Add(link)
 		fs.Add(rrc)
-		return &SeekableStream{FileStream: fs, rangeReadCloser: rrc, size: size}, nil
+		ss := &SeekableStream{FileStream: fs, rangeReadCloser: rrc, size: size}
+		
+		// Preload critical metadata regions for UDF files
+		if IsUDFType(fs.Obj.GetName()) {
+			go ss.preloadUDFMetadata()
+		}
+		
+		return ss, nil
 	}
 	return nil, fmt.Errorf("illegal seekableStream")
+}
+
+// Preload critical metadata regions for UDF files
+func (ss *SeekableStream) preloadUDFMetadata() {
+	ctx, cancel := context.WithTimeout(ss.Ctx, 30*time.Second)
+	defer cancel()
+
+	// Phased preloading of critical regions
+	ranges := []http_range.Range{
+		{Start: 0, Length: 2 * utils.MB},          // Volume descriptors
+		{Start: 2 * utils.MB, Length: 48 * utils.MB}, // Root directory and BDMV core
+		{Start: 50 * utils.MB, Length: 100 * utils.MB}, // Extended metadata
+	}
+
+	for _, r := range ranges {
+		select {
+		case <-ctx.Done():
+			return
+		default:
+			// Preload and cache
+			if _, err := ss.RangeRead(r); err != nil {
+				// Preloading failure doesn't affect main process, only log
+				fmt.Printf("preload UDF range %d-%d failed: %v\n", r.Start, r.Start+r.Length, err)
+			}
+		}
+	}
 }
 
 func (ss *SeekableStream) GetSize() int64 {
@@ -203,12 +312,58 @@ func (ss *SeekableStream) GetSize() int64 {
 	return ss.FileStream.GetSize()
 }
 
-//func (ss *SeekableStream) Peek(length int) {
-//
-//}
-
-// RangeRead is not thread-safe, pls use it in single thread only.
+// RangeRead is not thread-safe, please use only in single thread.
 func (ss *SeekableStream) RangeRead(httpRange http_range.Range) (io.Reader, error) {
+	isUDF := IsUDFType(ss.Obj.GetName())
+	
+	// For small range reads (<1MB) on UDF files, cache in memory to avoid repeated requests
+	if isUDF && httpRange.Length > 0 && httpRange.Length < 1*utils.MB {
+		cacheKey := fmt.Sprintf("%d-%d", httpRange.Start, httpRange.Start+httpRange.Length)
+		
+		// Check if cache exists
+		if cached, ok := ss.rangeCache.Load(cacheKey); ok {
+			return cached.(cachedItem).reader, nil
+		}
+
+		// Read and cache
+		rc, err := ss.rangeReadCloser.RangeRead(ss.Ctx, httpRange)
+		if err != nil {
+			return nil, err
+		}
+		
+		// Read small range data into memory cache
+		buf, err := io.ReadAll(rc)
+		if err != nil && !errors.Is(err, io.EOF) {
+			return nil, err
+		}
+		cachedReader := bytes.NewReader(buf)
+		ss.rangeCache.Store(cacheKey, cachedItem{
+			reader:    cachedReader,
+			isUDFMeta: httpRange.Start < 150*utils.MB, // Mark as metadata cache
+		})
+
+		// Limit cache size, only clean non-metadata cache
+		if ss.rangeCache.Len() > 200 {
+			var toDelete []interface{}
+			ss.rangeCache.Range(func(key, value any) bool {
+				item := value.(cachedItem)
+				if !item.isUDFMeta {
+					toDelete = append(toDelete, key)
+				}
+				return true
+			})
+			// Delete some normal cache
+			for i, key := range toDelete {
+				if i >= 100 {
+					break
+				}
+				ss.rangeCache.Delete(key)
+			}
+		}
+		return cachedReader, nil
+	}
+
+	// Original logic
 	if ss.tmpFile == nil && ss.rangeReadCloser != nil {
 		rc, err := ss.rangeReadCloser.RangeRead(ss.Ctx, httpRange)
 		if err != nil {
@@ -219,11 +374,6 @@ func (ss *SeekableStream) RangeRead(httpRange http_range.Range) (io.Reader, erro
 	return ss.FileStream.RangeRead(httpRange)
 }
 
-//func (f *FileStream) GetReader() io.Reader {
-//	return f.Reader
-//}
-
-// only provide Reader as full stream when it's demanded. in rapid-upload, we can skip this to save memory
 func (ss *SeekableStream) Read(p []byte) (n int, err error) {
 	if ss.Reader == nil {
 		if ss.rangeReadCloser == nil {
@@ -239,6 +389,11 @@ func (ss *SeekableStream) Read(p []byte) (n int, err error) {
 }
 
 func (ss *SeekableStream) CacheFullInTempFile() (model.File, error) {
+	// Disable automatic full caching for UDF files (unless explicitly required)
+	if IsUDFType(ss.Obj.GetName()) && !ss.ForceStreamUpload {
+		return nil, fmt.Errorf("skip full cache for UDF file")
+	}
+
 	if file := ss.GetFile(); file != nil {
 		return file, nil
 	}
@@ -400,7 +555,6 @@ func (r *RangeReadReadAtSeeker) getReaderAtOffset(off int64) (io.Reader, error) 
 		r.readerMap.Delete(int64(cur))
 	}
 	if off == int64(cur) {
-		// logrus.Debugf("getReaderAtOffset match_%d", off)
 		return rr, nil
 	}
 
@@ -408,11 +562,9 @@ func (r *RangeReadReadAtSeeker) getReaderAtOffset(off int64) (io.Reader, error) 
 		n, _ := utils.CopyWithBufferN(io.Discard, rr, off-cur)
 		cur += n
 		if cur == off {
-			// logrus.Debugf("getReaderAtOffset old_%d", off)
 			return rr, nil
 		}
 	}
-	// logrus.Debugf("getReaderAtOffset new_%d", off)
 
 	reader, err := r.ss.RangeRead(http_range.Range{Start: off, Length: -1})
 	if err != nil {
@@ -468,3 +620,20 @@ func (r *RangeReadReadAtSeeker) Read(p []byte) (n int, err error) {
 	r.masterOff += int64(n)
 	return n, err
 }
+
+// Helper function: get minimum of two int64 values
+func min(a, b int64) int64 {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+// Helper function: get maximum of two int64 values
+func max(a, b int64) int64 {
+	if a > b {
+		return a
+	}
+	return b
+}
+    
