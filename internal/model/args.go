@@ -40,9 +40,9 @@ type Link struct {
 	// 如果SyncClosers中的资源被关闭后Link将不可用，则此值应为 true
 	RequireReference bool `json:"-"`
 	Name    string   
-    	Hash    string  
-    	ModTime time.Time
-    	Size    int64 
+    Hash    string  
+    ModTime time.Time
+    Size    int64 
 }
 
 type OtherArgs struct {
