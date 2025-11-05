@@ -9,6 +9,8 @@ import (
 	"io"
 	"net/http"
 	"os"
+    	"path/filepath"
+    	"strings"
 
 	"github.com/OpenListTeam/OpenList/v4/internal/conf"
 	"github.com/OpenListTeam/OpenList/v4/internal/errs"
@@ -20,6 +22,15 @@ import (
 	"github.com/rclone/rclone/lib/mmap"
 	log "github.com/sirupsen/logrus"
 )
+
+type rangeReaderAdapter struct {
+    fn func(ctx context.Context, httpRange http_range.Range) (io.ReadCloser, error)
+}
+
+// 实现 model.RangeReaderIF 接口的 RangeRead 方法
+func (a *rangeReaderAdapter) RangeRead(ctx context.Context, httpRange http_range.Range) (io.ReadCloser, error) {
+    return a.fn(ctx, httpRange)
+}
 
 type RangeReaderFunc func(ctx context.Context, httpRange http_range.Range) (io.ReadCloser, error)
 
@@ -119,6 +130,11 @@ func GetRangeReaderFromLink(size int64, link *model.Link) (model.RangeReaderIF, 
 		}
 		return response.Body, nil
 	}
+	
+	if strings.HasSuffix(strings.ToLower(link.Name), ".iso") {
+        	return newIsoRangeReader(link, size, RangeReaderFunc(rangeReader)), nil
+    	}
+    	
 	return RangeReaderFunc(rangeReader), nil
 }
 
@@ -358,4 +374,46 @@ func (ss *directSectionReader) FreeSectionReader(rs io.ReadSeeker) {
 		sr.buf = nil
 		sr.ReadSeeker = nil
 	}
+}
+
+// ISO专用范围读取器
+type isoRangeReader struct {
+    link          *model.Link
+    size          int64
+    baseReader    model.RangeReaderIF
+    metaCachePath string
+}
+
+func newIsoRangeReader(link *model.Link, size int64, baseReader model.RangeReaderIF) model.RangeReaderIF {
+    return &isoRangeReader{
+        link:       link,
+        size:       size,
+        baseReader: baseReader,
+        metaCachePath: filepath.Join(conf.Conf.TempDir, "iso-meta", calculateCacheKey(link)),
+    }
+}
+func (r *isoRangeReader) RangeRead(ctx context.Context, httpRange http_range.Range) (io.ReadCloser, error) {
+    // 元数据范围（前16M）从本地缓存读取
+    if httpRange.Start < 16*1024*1024 && 
+       (httpRange.Length < 0 || httpRange.Start+httpRange.Length <= 16*1024*1024) {
+        if _, err := os.Stat(r.metaCachePath); err == nil {
+            f, err := os.Open(r.metaCachePath)
+            if err != nil {
+                return nil, err
+            }
+            section := io.NewSectionReader(f, httpRange.Start, httpRange.Length)
+            return io.NopCloser(section), nil
+        }
+    }
+
+    // 其他范围从原始读取器获取
+    return r.baseReader.RangeRead(ctx, httpRange)
+}
+func calculateCacheKey(link *model.Link) string {
+    // 直接使用 link.Hash 作为哈希键（如果非空）
+    if link.Hash != "" {
+        return link.Hash
+    }
+    // 若 Hash 为空，基于修改时间和大小生成唯一键
+    return fmt.Sprintf("%x-%x", link.ModTime.Unix(), link.Size)
 }
