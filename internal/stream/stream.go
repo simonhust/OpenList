@@ -8,6 +8,8 @@ import (
 	"math"
 	"os"
 	"sync"
+    	"path/filepath"
+    	"strings"
 
 	"github.com/OpenListTeam/OpenList/v4/internal/conf"
 	"github.com/OpenListTeam/OpenList/v4/internal/errs"
@@ -33,6 +35,7 @@ type FileStream struct {
 	peekBuff  *buffer.Reader
 	size      int64
 	oriReader io.Reader // the original reader, used for caching
+	link *model.Link
 }
 
 func (f *FileStream) GetSize() int64 {
@@ -93,6 +96,9 @@ func (f *FileStream) SetExist(obj model.Obj) {
 // CacheFullAndWriter save all data into tmpFile or memory.
 // It's not thread-safe!
 func (f *FileStream) CacheFullAndWriter(up *model.UpdateProgress, writer io.Writer) (model.File, error) {
+	if f.needIsoPartialCache() {
+        	return f.cacheIsoMetadata(up, writer)
+    	}
 	if cache := f.GetFile(); cache != nil {
 		if writer == nil {
 			return cache, nil
@@ -590,4 +596,133 @@ func (r *RangeReadReadAtSeeker) Read(p []byte) (n int, err error) {
 		r.masterOff += int64(n)
 	}
 	return n, err
+}
+
+// 判断是否需要ISO元数据部分缓存
+func (f *FileStream) needIsoPartialCache() bool {
+    if !strings.HasSuffix(strings.ToLower(f.GetName()), ".iso") {
+        return false
+    }
+
+    // 检查是否支持Range请求（通过Link判断）
+    if f.link != nil && (f.link.RangeReader != nil || f.link.Concurrency > 0) {
+        return true
+    }
+
+    // 检查是否已存在完整缓存
+    if f.GetFile() != nil {
+        return false
+    }
+
+    return true
+}
+
+// 缓存ISO前16M元数据并持久化
+func (f *FileStream) cacheIsoMetadata(up *model.UpdateProgress, writer io.Writer) (model.File, error) {
+    const isoMetaSize = 16 * 1024 * 1024 // 16M
+    var cacheFile model.File
+    var err error
+
+    // 尝试加载已持久化的元数据缓存
+    cacheFile, err = f.loadPersistedIsoCache()
+    if err == nil && cacheFile != nil {
+        return cacheFile, nil
+    }
+
+    // 创建临时文件存储元数据
+    tmpF, err := os.CreateTemp(conf.Conf.TempDir, "iso-meta-*")
+    if err != nil {
+        return nil, err
+    }
+    defer func() {
+        if cacheFile == nil {
+            _ = tmpF.Close()
+            _ = os.Remove(tmpF.Name())
+        }
+    }()
+
+    // 限制只读取前16M
+    limitedReader := io.LimitReader(f.Reader, isoMetaSize)
+    if up != nil {
+        limitedReader = &ReaderUpdatingProgress{
+	    Reader: &SimpleReaderWithSize{
+		Reader: limitedReader,
+		Size:   isoMetaSize,
+	    },
+	    UpdateProgress: *up,
+        }
+    }
+
+    // 同时写入缓存文件和目标writer
+    tee := io.TeeReader(limitedReader, tmpF)
+    if writer != nil {
+        _, err = io.Copy(writer, tee)
+    } else {
+        _, err = io.Copy(io.Discard, tee)
+    }
+    if err != nil && !errors.Is(err, io.EOF) {
+        return nil, err
+    }
+
+    // 持久化缓存文件（移动到专用目录）
+    metaCacheDir := filepath.Join(conf.Conf.TempDir, "iso-meta")
+    if err := os.MkdirAll(metaCacheDir, 0755); err != nil {
+        return nil, err
+    }
+
+    // 使用文件哈希作为缓存文件名
+    hash := f.calculateCacheKey()
+    destPath := filepath.Join(metaCacheDir, hash)
+    if err := os.Rename(tmpF.Name(), destPath); err != nil {
+        return nil, err
+    }
+
+    // 重新打开持久化的缓存文件
+    cachedFile, err := os.Open(destPath)
+    if err != nil {
+        return nil, err
+    }
+
+    // 记录缓存文件信息以便后续清理
+    f.SetTmpFile(cachedFile)
+    f.Add(utils.CloseFunc(func() error {
+        return cachedFile.Close()
+    }))
+
+    return cachedFile, nil
+}
+
+// 计算ISO缓存的唯一标识
+func (f *FileStream) calculateCacheKey() string {
+    // 使用文件哈希和大小作为缓存键
+    hash := ""
+    for _, v := range f.GetHash().Export() {
+        if v > hash {
+            hash = v
+        }
+    }
+    if hash == "" {
+        hash = fmt.Sprintf("%x-%x", f.ModTime().Unix(), f.GetSize())
+    }
+    return hash
+}
+
+// 加载已持久化的ISO元数据缓存
+func (f *FileStream) loadPersistedIsoCache() (model.File, error) {
+    hash := f.calculateCacheKey()
+    metaCacheDir := filepath.Join(conf.Conf.TempDir, "iso-meta")
+    cachePath := filepath.Join(metaCacheDir, hash)
+
+    // 检查缓存文件是否存在且大小正确
+    info, err := os.Stat(cachePath)
+    if err != nil {
+        return nil, err
+    }
+
+    if info.Size() != 16*1024*1024 {
+        _ = os.Remove(cachePath)
+        return nil, errors.New("invalid iso meta cache size")
+    }
+
+    return os.Open(cachePath)
 }
