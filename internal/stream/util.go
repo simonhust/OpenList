@@ -9,8 +9,8 @@ import (
 	"io"
 	"net/http"
 	"os"
-    	"path/filepath"
-    	"strings"
+    "path/filepath"
+    "strings"
 
 	"github.com/OpenListTeam/OpenList/v4/internal/conf"
 	"github.com/OpenListTeam/OpenList/v4/internal/errs"
